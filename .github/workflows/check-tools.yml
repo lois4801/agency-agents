@@ -36,6 +36,9 @@ jobs:
         # maintainers regenerate at landing) and enforced on pushes to main.
         run: bash scripts/test-convert-outputs.sh ${{ github.event_name == 'pull_request' && '--drift=advisory' || '' }}
 
+      - name: Parse indented code fences like lib.sh in the outputs eval
+        run: bash scripts/test-convert-fence-model.sh
+
       - name: Validate agent selection (install.sh --agent / --agents-file)
         run: bash scripts/test-agent-selection.sh
 
@@ -56,3 +59,12 @@ jobs:
 
       - name: Reject unclosed agent frontmatter
         run: bash scripts/test-frontmatter-closing.sh
+
+      - name: Reject code fences that do not nest or never close
+        run: bash scripts/test-lint-fences.sh
+
+      - name: Unknown options fail; --help lists every option
+        run: bash scripts/test-cli-usage.sh
+
+      - name: Keep installing after one tool fails, then exit non-zero
+        run: bash scripts/test-install-continue-after-failure.sh

@@ -33,8 +33,9 @@
 # Selection (compose freely; empty = everything):
 #   --tool <a,b>          Only these tools
 #   --division <a,b>      Only these teams/divisions (comma-separated)
-#   --agent <slug,slug>   Only these specific agents
-#   --agents-file <path>  Agents listed in a file (one slug/name per line, # comments ok)
+#   --agent <id,id>       Only these specific agents (install slug, display name,
+#                         or file stem such as engineering-frontend-developer)
+#   --agents-file <path>  Agents listed in a file (one id per line, # comments ok)
 #
 # Mode:
 #   --link                Symlink instead of copy (updates propagate)
@@ -165,6 +166,7 @@ AGENTS_FILE=""           # --agents-file
 DRY_RUN=false            # --dry-run
 SELECTION_ACTIVE=false   # true once any agent-level filter is applied
 _ALLOWED_SLUGS=""        # newline-delimited cache of allowed slugs
+_ROSTER_INDEX=""         # "<install slug>\t<file stem>" per agent; see roster_index
 
 # division_files <division> — agent file paths (frontmatter only) in a division.
 division_files() {
@@ -178,16 +180,43 @@ division_files() {
 # division_count <division> — number of agents in a division.
 division_count() { division_files "$1" | grep -c . ; }
 
-# agent_slug_exists <slug> — verify a requested agent against the source roster.
-# Selection filters should fail before installation when they name nothing that
-# can be installed; otherwise dry-run counts and completion messages lie.
-agent_slug_exists() {
-  local target="$1" div f
+# roster_index — fill _ROSTER_INDEX with one "<install slug>\t<file stem>" line
+# per agent, once. Call it in the parent shell before resolve_agent: a $(...)
+# caller would build its own copy and throw it away.
+#
+# Resolving each requested agent used to rescan the roster, running get_field
+# on all 279 files per request, so a 36-agent runbook roster cost ~10,000
+# get_field calls before anything installed.
+roster_index() {
+  [[ -n "$_ROSTER_INDEX" ]] && return 0
+  local div f
   for div in "${ALL_DIVISIONS[@]}"; do
     while IFS= read -r f; do
-      [[ "$(agent_slug "$f")" == "$target" ]] && return 0
+      _ROSTER_INDEX+="$(agent_slug "$f")"$'\t'"$(basename "$f" .md)"$'\n'
     done < <(division_files "$div")
   done
+}
+
+# resolve_agent <requested> — print the install slug for a requested agent,
+# 1 if nothing matches. Selection filters should fail before installation when
+# they name nothing that can be installed; otherwise dry-run counts and
+# completion messages lie.
+#
+# Two spellings name an agent. The install slug comes from `name:` and is what
+# --list agents prints. The file stem is the corpus id strategy/runbooks.json
+# uses ("engineering-frontend-developer"), and for 206 of 279 agents it is not
+# the slug, so 35 of the 36 agents the runbooks list could not be selected by
+# the ids the runbooks give. Slugs are tried first; no stem equals another
+# agent's slug today, and slug-first keeps it unambiguous if one ever does.
+resolve_agent() {
+  local target="$1" slug stem
+  [[ -n "$target" ]] || return 1
+  while IFS=$'\t' read -r slug stem; do
+    [[ -n "$slug" && "$slug" == "$target" ]] && { printf '%s' "$slug"; return 0; }
+  done <<< "$_ROSTER_INDEX"
+  while IFS=$'\t' read -r slug stem; do
+    [[ -n "$slug" && "$stem" == "$target" ]] && { printf '%s' "$slug"; return 0; }
+  done <<< "$_ROSTER_INDEX"
   return 1
 }
 
@@ -199,7 +228,8 @@ build_selection() {
     return
   fi
   SELECTION_ACTIVE=true
-  local slugs="" div f s line requested
+  local slugs="" div f s line requested resolved
+  roster_index
   for div in ${FILTER_DIVISIONS[@]+"${FILTER_DIVISIONS[@]}"}; do
     while IFS= read -r f; do
       s="$(agent_slug "$f")"; [[ -n "$s" ]] && slugs+="$s"$'\n'
@@ -207,11 +237,11 @@ build_selection() {
   done
   for s in ${FILTER_AGENTS[@]+"${FILTER_AGENTS[@]}"}; do
     requested="$(slugify "$s")"
-    if ! agent_slug_exists "$requested"; then
+    if ! resolved="$(resolve_agent "$requested")"; then
       err "Unknown agent '$s'. Use --list agents to see the available roster."
       exit 1
     fi
-    slugs+="$requested"$'\n'
+    slugs+="$resolved"$'\n'
   done
   if [[ -n "$AGENTS_FILE" ]]; then
     [[ -f "$AGENTS_FILE" ]] || { err "agents-file not found: $AGENTS_FILE"; exit 1; }
@@ -220,11 +250,11 @@ build_selection() {
       line="$(printf '%s' "$line" | xargs 2>/dev/null)" # trim
       [[ -z "$line" ]] && continue
       requested="$(slugify "$line")"
-      if ! agent_slug_exists "$requested"; then
+      if ! resolved="$(resolve_agent "$requested")"; then
         err "Unknown agent '$line' in agents-file '$AGENTS_FILE'."
         exit 1
       fi
-      slugs+="$requested"$'\n'
+      slugs+="$resolved"$'\n'
     done < "$AGENTS_FILE"
   fi
   _ALLOWED_SLUGS="$(printf '%s' "$slugs" | sort -u | sed '/^$/d')"
@@ -283,26 +313,30 @@ OVERRIDE_PATH=""      # --path (single-destination override)
 
 # install_file <src> <dest> — copy, or symlink when --link is set.
 install_file() {
-  if $USE_LINK; then
-    ln -sf "$1" "$2"
-  else
-    local target="$2"
-    [[ -d "$target" ]] && target="${target%/}/$(basename "$1")"
-    if [[ -L "$target" ]]; then
-      # cp would follow the link and overwrite whatever it points at.
-      local link_to; link_to="$(readlink "$target")"
-      if [[ "$link_to" == "$REPO_ROOT/"* ]]; then
-        # Our own --link install: switching to a copy is the intended change.
-        rm -f -- "$target"
-      else
-        # Someone else's link: leave it and its target alone, keep installing
-        # the rest, and say so in the summary (one stray link must not abort
-        # the install halfway through the roster).
-        warn "Skipped $target — it is a symlink to $link_to; not overwriting it."
-        [[ -n "${SKIPPED_LOG:-}" ]] && printf '%s -> %s\n' "$target" "$link_to" >> "$SKIPPED_LOG"
-        return 0
-      fi
+  local target="$2"
+  # Directory destinations have a trailing slash. Do not follow a leaf
+  # symlink to a directory when deciding which file belongs to the installer.
+  if [[ "$target" == */ ]] || { ! $USE_LINK && [[ -d "$target" ]]; }; then
+    target="${target%/}/$(basename "$1")"
+  fi
+  if [[ -L "$target" ]]; then
+    local link_to; link_to="$(readlink "$target")"
+    if [[ "$link_to" == "$REPO_ROOT/"* ]]; then
+      # An installer-owned link may be refreshed or switched to a copy.
+      rm -f -- "$target"
+    else
+      warn "Skipped $target — it is a symlink to $link_to; not overwriting it."
+      [[ -n "${SKIPPED_LOG:-}" ]] && printf '%s -> %s\n' "$target" "$link_to" >> "$SKIPPED_LOG"
+      return 0
     fi
+  elif $USE_LINK && [[ -e "$target" ]]; then
+    warn "Skipped $target — it already exists; not replacing it with a symlink."
+    [[ -n "${SKIPPED_LOG:-}" ]] && printf '%s (existing file)\n' "$target" >> "$SKIPPED_LOG"
+    return 0
+  fi
+  if $USE_LINK; then
+    ln -s "$1" "$target"
+  else
     cp "$1" "$2"
   fi
 }
@@ -311,12 +345,20 @@ install_file() {
 # path_collision_group <tool> — tools in the same group write identical
 # filenames into a shared --path and would overwrite each other; empty means
 # the tool's output is distinct and may share a path with anything. Derived by
-# installing one agent with every tool into a sandbox and comparing what
-# landed; re-measure if a converter's output naming changes.
+# installing agents with every tool into a sandbox and comparing what landed;
+# re-measure if a converter's output naming changes.
+#
+# claude-code and copilot copy the source file under its own name. For most
+# agents that is <division>-<slug>.md, but 73 of 279 are named <slug>.md
+# already (all of game-development/, most of specialized/), and for those the
+# name is exactly what gemini-cli, opencode, qwen and zcode write. Measuring
+# with one engineering agent missed that, so `--tool claude-code,qwen --path X`
+# reported both installs OK while qwen overwrote the Claude Code file. One
+# group, because a full install collides on 73 files, not zero.
 path_collision_group() {
   case "$1" in
-    claude-code|copilot)             printf 'raw-source-md' ;;  # <division>-<slug>.md
-    gemini-cli|opencode|qwen|zcode)  printf 'slug-md' ;;        # <slug>.md
+    claude-code|copilot|gemini-cli|opencode|qwen|zcode)
+                                     printf 'agent-md' ;;       # <slug>.md, or the source's name
     antigravity|osaurus|dsh)         printf 'agency-skill' ;;   # agency-<slug>/SKILL.md
     *)                               printf '' ;;
   esac
@@ -456,9 +498,14 @@ usage() {
   # (excluding the sentinel lines themselves) and strip the leading "# ".
   # Using sentinels instead of hard-coded line numbers means adding lines
   # to the header comment block won't silently break --help output.
-  sed -n '/^# --- USAGE-START ---/,/^# --- USAGE-END ---/p' "$0" \
-    | sed -e '1d;$d' -e 's/^# \{0,1\}//'
-  exit 0
+  # An unknown option passes 1: the text goes to stderr and the exit is
+  # non-zero, so a mistyped flag in CI or a wrapper script is not a success.
+  local status="${1:-0}"
+  local text
+  text="$(sed -n '/^# --- USAGE-START ---/,/^# --- USAGE-END ---/p' "$0" \
+    | sed -e '1d;$d' -e 's/^# \{0,1\}//')"
+  if (( status == 0 )); then printf '%s\n' "$text"; else printf '%s\n' "$text" >&2; fi
+  exit "$status"
 }
 
 # Default parallel job count (nproc on Linux; sysctl on macOS when nproc missing)
@@ -1281,6 +1328,16 @@ if has_enabled and not enabled_empty and not inline_flow:
             item_indent = lines[idx][: len(lines[idx]) - len(stripped)]
             break
 
+# A trailing YAML comment is not part of an item's value: "#" starts a comment
+# only after whitespace, so strip it before matching. The earlier raw compare
+# missed an existing entry that carried a comment (adding a duplicate) and let
+# a comment containing " - " trip the corrupted-glue repair below.
+def strip_comment(text):
+    return re.sub(r"\s+#.*$", "", text).strip()
+
+def item_value(text):
+    return strip_comment(text).strip("\"'")
+
 # Detect "already enabled" + corrupted-scalar form (glued "- " from old 2-space bug); repair splits to one per line.
 corrupted_lines = []
 has_plugin_already = False
@@ -1292,13 +1349,11 @@ elif has_enabled and not enabled_empty:
         stripped = l.strip()
         if not stripped.startswith("-"):
             continue
-        # >1 "- " in stripped line = corrupted glue (strict match won't work: names contain dashes).
-        if stripped.count("- ") > 1:
+        # Any "- " inside the comment-stripped value = corrupted glue (strict match won't work: names contain dashes).
+        if strip_comment(stripped[1:]).count("- ") > 0:
             corrupted_lines.append(idx)
-        else:
-            value = stripped[1:].strip().strip("\"'")
-            if value == plugin_strip:
-                has_plugin_already = True
+        elif item_value(stripped[1:]) == plugin_strip:
+            has_plugin_already = True
 
 # Repair in reverse to keep indices. Splice grows the block — sync enabled_end with end_line or the stale sweep eats the new plugin (#879).
 for idx in sorted(corrupted_lines, reverse=True):
@@ -1306,7 +1361,7 @@ for idx in sorted(corrupted_lines, reverse=True):
     stripped = l.strip()
     if not item_indent:
         item_indent = l[: len(l) - len(stripped)] or (enabled_indent + "  ")
-    content = stripped[1:].strip()
+    content = strip_comment(stripped[1:])
     parts = re.split(r"\s+-\s+", content)
     new_lines = [f"{item_indent}- {parts[0]}"]
     for p in parts[1:]:
@@ -1317,7 +1372,8 @@ for idx in sorted(corrupted_lines, reverse=True):
     # Re-check presence after rewrite.
     has_plugin_already = False
     for nl in lines[enabled_idx + 1 : enabled_end]:
-        if nl.strip().startswith("-") and nl[len(item_indent) :].strip() == f"- {plugin_strip}":
+        ns = nl.strip()
+        if ns.startswith("-") and item_value(ns[1:]) == plugin_strip:
             has_plugin_already = True
             break
 
@@ -1335,8 +1391,7 @@ if plugin_start is not None:
         for idx in rng:
             stripped = lines[idx].strip()
             if stripped.startswith("-"):
-                value = stripped[1:].strip().strip("\"'")
-                if value == plugin_strip:
+                if item_value(stripped[1:]) == plugin_strip:
                     stale.append(idx)
     for idx in sorted(stale, reverse=True):
         del lines[idx]
@@ -1553,7 +1608,7 @@ main() {
       --parallel)        use_parallel=true; shift ;;
       --jobs)            parallel_jobs="${2:?'--jobs requires a value'}"; shift 2 ;;
       --help|-h)         usage ;;
-      *)                 err "Unknown option: $1"; usage ;;
+      *)                 err "Unknown option: $1"; usage 1 ;;
     esac
   done
 
@@ -1676,18 +1731,20 @@ main() {
   fi
   printf "\n"
 
-  local installed=0 t i=0
+  local installed=0 t i=0 rc
+  local failed=()
   if $use_parallel; then
-    local install_out_dir
+    local install_out_dir install_status=0
     install_out_dir="$(mktemp -d)"
     export AGENCY_INSTALL_OUT_DIR="$install_out_dir"
     export AGENCY_INSTALL_SCRIPT="$SCRIPT_DIR/install.sh"
     export AGENCY_INSTALL_EXTRA="$(worker_flags)"
-    printf '%s\n' "${SELECTED_TOOLS[@]}" | xargs -P "$parallel_jobs" -I {} sh -c 'AGENCY_INSTALL_WORKER=1 "$AGENCY_INSTALL_SCRIPT" --tool "{}" --no-interactive $AGENCY_INSTALL_EXTRA > "$AGENCY_INSTALL_OUT_DIR/{}" 2>&1'
+    printf '%s\n' "${SELECTED_TOOLS[@]}" | xargs -P "$parallel_jobs" -I {} sh -c 'AGENCY_INSTALL_WORKER=1 "$AGENCY_INSTALL_SCRIPT" --tool "{}" --no-interactive $AGENCY_INSTALL_EXTRA > "$AGENCY_INSTALL_OUT_DIR/{}" 2>&1' || install_status=$?
     for t in "${SELECTED_TOOLS[@]}"; do
       [[ -f "$install_out_dir/$t" ]] && cat "$install_out_dir/$t"
     done
     rm -rf "$install_out_dir"
+    [[ "$install_status" -eq 0 ]] || return "$install_status"
     installed=$n_selected
   else
     for t in "${SELECTED_TOOLS[@]}"; do
@@ -1695,25 +1752,50 @@ main() {
       progress_bar "$i" "$n_selected"
       printf "\n"
       printf "  ${C_DIM}[%s/%s]${C_RESET} %s\n" "$i" "$n_selected" "$t"
-      install_tool "$t"
-      (( installed++ )) || true
+      # One tool failing must not cost the tools after it. A bare
+      # install_tool under set -e exited the whole script at the first
+      # `return 1`, so a missing integrations/cursor meant qwen, codex and
+      # every later tool were never tried and nothing said so.
+      #
+      # Not `install_tool "$t" || ...`: bash ignores errexit inside anything
+      # run on the left of || (subshell included), so a failing cp inside a
+      # tool would carry on as if it had worked. The subshell turns errexit
+      # back on for itself while the parent's is off for this one command.
+      set +e
+      ( set -e; install_tool "$t" )
+      rc=$?
+      set -e
+      if (( rc == 0 )); then
+        (( installed++ )) || true
+      else
+        failed+=("$t")
+      fi
     done
   fi
 
   # Done box
   local msg="  Done!  Installed $installed tool(s)."
+  (( ${#failed[@]} )) && msg="  Installed $installed of $n_selected tool(s)."
   printf "\n"
   box_top
-  box_row "${C_GREEN}${C_BOLD}${msg}${C_RESET}"
+  if (( ${#failed[@]} )); then
+    box_row "${C_YELLOW}${C_BOLD}${msg}${C_RESET}"
+  else
+    box_row "${C_GREEN}${C_BOLD}${msg}${C_RESET}"
+  fi
   box_bot
   printf "\n"
   if [[ -s "$SKIPPED_LOG" ]]; then
-    warn "Not installed: $(wc -l < "$SKIPPED_LOG" | tr -d ' ') file(s) whose destination is a symlink to somewhere else:"
+    warn "Not installed: $(wc -l < "$SKIPPED_LOG" | tr -d ' ') file(s) whose destination is an existing user file or foreign symlink:"
     sed 's/^/    /' "$SKIPPED_LOG" >&2
-    warn "Remove or replace those links, then re-run to install them."
+    warn "Move or remove those destinations, then re-run to install them."
   fi
   dim "  Run ./scripts/convert.sh to regenerate after adding or editing agents."
   printf "\n"
+  if (( ${#failed[@]} )); then
+    err "Failed: ${failed[*]} — see the [ERR] line under each above. The other tools installed."
+    exit 1
+  fi
 }
 
 main "$@"

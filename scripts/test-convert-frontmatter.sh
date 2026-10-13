@@ -56,6 +56,15 @@ assert_quoted \
   "$OUTPUT_DIR/qwen/agents/programmatic-display-buyer.md" \
   tools
 
+# Qwen resolves tools by its own names and silently keeps one it does not know,
+# so Claude Code's Read/Write/Bash have to arrive as read_file/write_file/
+# run_shell_command or the agent cannot read, create files, or run a shell.
+qwen_tools_line="$(grep -m1 '^tools:' "$OUTPUT_DIR/qwen/agents/programmatic-display-buyer.md")"
+[[ "$qwen_tools_line" == "tools: 'web_fetch, web_search, read_file, write_file, edit, run_shell_command'" ]] || {
+  printf 'Expected Qwen tool names in programmatic-display-buyer, got: %s\n' "$qwen_tools_line" >&2
+  exit 1
+}
+
 # A present but empty required field is unusable discovery metadata. Check the
 # source linter directly, including YAML's quoted empty-string form.
 cat > "$OUTPUT_DIR/agent.md" <<'EOF'

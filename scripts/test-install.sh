@@ -330,9 +330,9 @@ echo ""
 echo "parallel workers"
 
 # Two tools that write the same filenames into one shared --path would silently
-# overwrite each other (claude-code and copilot both copy the raw source as
-# <division>-<slug>.md). The installer must refuse, not clobber. Both tools work
-# under --no-convert, which keeps this case cheap in CI.
+# overwrite each other (claude-code and copilot both copy the raw source under
+# its own name). The installer must refuse, not clobber. Both tools work under
+# --no-convert, which keeps this case cheap in CI.
 home="$(sandbox path-collision)"
 dest="$home/My [Agents]/dest dir"
 run_install "$home" --tool claude-code,copilot --no-convert --agent "$FIRST_ENG_SLUG" --path "$dest"
@@ -340,8 +340,22 @@ assert_eq 1 "$RUN_STATUS" "two tools that write the same filenames into one --pa
 assert_eq 1 "$(printf '%s' "$RUN_OUT" | grep -c 'overwrite')" "the refusal explains the collision"
 assert_eq 0 "$(count_md "$dest")" "a refused install writes nothing"
 
+# A source file's own name is not always <division>-<slug>.md: 73 agents are
+# named <slug>.md, which is what the converted .md tools write. claude-code and
+# qwen with one of those used to report two successful installs while qwen's
+# file replaced Claude Code's. The refusal comes before any conversion, so this
+# stays cheap too.
+slug_named="$(for f in "$REPO_ROOT"/game-development/*.md; do
+  is_agent_file "$f" && [[ "$(basename "$f" .md)" == "$(agent_slug "$f")" ]] && { agent_slug "$f"; break; }
+done)"
+home="$(sandbox path-collision-slug-named)"
+dest="$home/dest"
+run_install "$home" --tool claude-code,qwen --agent "$slug_named" --path "$dest"
+assert_eq 1 "$RUN_STATUS" "claude-code and qwen share <slug>.md names, so one --path is refused ($slug_named)"
+assert_eq 0 "$(count_md "$dest")" "the refused claude-code+qwen install writes nothing"
+
 # The propagation cases below therefore use a NON-colliding pair: claude-code
-# writes <division>-<slug>.md and codex writes <slug>.toml, so BOTH outputs must
+# writes .md and codex writes <slug>.toml, so BOTH outputs must
 # survive in the shared --path — which is a stronger check than one tool's count
 # alone (a count of 1 cannot tell "two wrote, one clobbered" from "one wrote").
 # codex has no committed output (integrations/ is generated and gitignored), so
@@ -361,7 +375,11 @@ dest="$home/My [Agents]/dest dir"
 list="$home/my agents list.txt"
 { echo "# one agent, listed in a file whose own path has spaces"; echo "$FIRST_ENG_SLUG"; } > "$list"
 run_install "$home" --tool claude-code,codex --parallel --jobs 1 --agents-file "$list" --path "$dest"
-assert_eq 0 "$RUN_STATUS" "--parallel with a spaced/globbed --path exits 0"
+# This used to pass for the wrong reason: the workers get the spaced path split
+# into words, reject the stray words as unknown options, and usage() exited 0,
+# so every worker "succeeded" having installed nothing (the count below).
+# Unknown options exit 1 now, so the exit code tells the truth until #755 lands.
+xfail_eq 0 "$RUN_STATUS" "--parallel with a spaced/globbed --path exits 0" "PR #755"
 xfail_eq 1 "$(count_md "$dest")" \
   "--parallel installs exactly the one selected agent (spaced --path + --agents-file)" "PR #755"
 

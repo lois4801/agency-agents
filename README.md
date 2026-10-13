@@ -102,6 +102,15 @@ Browse the agents below and copy/adapt the ones you need!
 ./scripts/install.sh --tool opencode --division engineering --dry-run
 ```
 
+`--agent` and `--agents-file` take an agent's slug (as `--list agents` prints it), its display name, or its file name without `.md` — the id the [runbook rosters](strategy/runbooks.json) use — so a runbook's team installs as listed:
+
+```bash
+python3 -c 'import json, sys
+for r in json.load(open("strategy/runbooks.json"))["runbooks"]:
+    if r["slug"] == sys.argv[1]: [print(a) for g in r["roster"] for a in g["agents"]]' startup-mvp > team.txt
+./scripts/install.sh --tool claude-code --agents-file team.txt
+```
+
 > **OpenCode note:** OpenCode's runtime currently registers only ~119 agents and silently drops the rest ([upstream bug](https://github.com/anomalyco/opencode/issues/27988)). Installing a subset with `--division` keeps you under that limit. The installer warns you when a selection would exceed it.
 
 See the [Multi-Tool Integrations](#-multi-tool-integrations) section below for full details.

@@ -104,3 +104,7 @@ jobs:
         run: |
           chmod +x scripts/lint-agents.sh
           ./scripts/lint-agents.sh
+
+      - name: Reject folded frontmatter fixtures
+        if: steps.rules.outputs.changed == 'true'
+        run: bash scripts/test-folded-frontmatter.sh

@@ -6,6 +6,7 @@
 # converted files to integrations/<tool>/. Run this to regenerate all
 # integration files after adding or modifying agents.
 #
+# --- USAGE-START ---  (sentinel for usage(); do not remove)
 # Usage:
 #   ./scripts/convert.sh [--tool <name>] [--out <dir>] [--parallel] [--jobs N] [--help]
 #
@@ -30,8 +31,12 @@
 # Output is written to integrations/<tool>/ relative to the repo root.
 # This script never touches user config dirs — see install.sh for that.
 #
+#   --tool <name>    Convert for one tool (default: all).
+#   --out <dir>      Write to <dir>/<tool>/ instead of integrations/<tool>/.
 #   --parallel       When tool is 'all', run independent tools in parallel (output order may vary).
 #   --jobs N         Max parallel jobs when using --parallel (default: nproc or 4).
+#
+# --- USAGE-END ---  (sentinel for usage(); do not remove)
 
 set -euo pipefail
 
@@ -77,9 +82,18 @@ AGENT_DIRS=(
 )
 
 # --- Usage ---
+# usage [status] — print the header between the USAGE sentinels and exit.
+# `--help` exits 0 on stdout; an unknown option exits 1 with the text on
+# stderr. The old hard-coded `sed -n '3,28p'` stopped above --parallel,
+# --jobs and --out, and exiting 0 after "Unknown option" meant a mistyped
+# flag in CI or a wrapper script read as success.
 usage() {
-  sed -n '3,28p' "$0" | sed 's/^# \{0,1\}//'
-  exit 0
+  local status="${1:-0}"
+  local text
+  text="$(sed -n '/^# --- USAGE-START ---/,/^# --- USAGE-END ---/p' "$0" \
+    | sed -e '1d;$d' -e 's/^# \{0,1\}//')"
+  if (( status == 0 )); then printf '%s\n' "$text"; else printf '%s\n' "$text" >&2; fi
+  exit "$status"
 }
 
 # Default parallel job count (nproc on Linux; sysctl on macOS when nproc missing)
@@ -456,13 +470,55 @@ HEREDOC
   fi
 }
 
+# qwen_tools <claude-tools> — the source's Claude Code tool list, renamed to the
+# tools Qwen Code registers.
+#
+# Sources list tools by Claude Code name ("WebFetch, WebSearch, Read, Write,
+# Edit"). Qwen resolves each entry against its own registry by tool name or
+# display name, and keeps an entry that matches neither as-is, so it matches
+# no tool (subagent-manager.ts resolveToolNames). Edit, WebFetch, WebSearch,
+# Grep and Glob happen to be Qwen display names too. Read, Write and Bash are
+# not (Qwen's are ReadFile, WriteFile and Shell), and `tools:` is an
+# allow-list, so those agents came up in Qwen able to edit files but not read
+# or create them, and the seven that list Bash with no shell.
+#
+# Names are mapped to Qwen's canonical tool names (tools/tool-names.ts); an
+# entry with no Qwen equivalent passes through unchanged.
+qwen_tools() {
+  local out="" t q
+  local IFS=','
+  for t in $1; do
+    t="${t#"${t%%[![:space:]]*}"}"; t="${t%"${t##*[![:space:]]}"}"
+    [[ -n "$t" ]] || continue
+    case "$t" in
+      Read)         q="read_file" ;;
+      Write)        q="write_file" ;;
+      Edit)         q="edit" ;;
+      MultiEdit)    q="edit" ;;
+      Bash)         q="run_shell_command" ;;
+      Grep)         q="grep_search" ;;
+      Glob)         q="glob" ;;
+      LS)           q="list_directory" ;;
+      WebFetch)     q="web_fetch" ;;
+      WebSearch)    q="web_search" ;;
+      TodoWrite)    q="todo_write" ;;
+      NotebookEdit) q="notebook_edit" ;;
+      Task)         q="agent" ;;
+      *)            q="$t" ;;
+    esac
+    case ", $out, " in *", $q, "*) continue ;; esac   # MultiEdit + Edit -> one edit
+    out="${out:+$out, }$q"
+  done
+  printf '%s' "$out"
+}
+
 convert_qwen() {
   local file="$1"
   local name description tools slug outfile body
 
   name="$(get_field "name" "$file")"
   description="$(get_field "description" "$file")"
-  tools="$(get_field "tools" "$file")"
+  tools="$(qwen_tools "$(get_field "tools" "$file")")"
   slug="$(slugify "$name")"
   body="$(get_body "$file")"
 
@@ -793,7 +849,7 @@ main() {
       --parallel) use_parallel=true; shift ;;
       --jobs)     parallel_jobs="${2:?'--jobs requires a value'}"; shift 2 ;;
       --help|-h)  usage ;;
-      *)          error "Unknown option: $1"; usage ;;
+      *)          error "Unknown option: $1"; usage 1 ;;
     esac
   done
 
